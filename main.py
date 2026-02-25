@@ -2,9 +2,9 @@
  * SMC Telegram Bot (Binance Futures USDT Perpetual)
  * Режим "рыболовная сеть" включён: больше сигналов, больше шума, потом ужесточим.
  *
- * Как запускать:
- * 1) npm i node-fetch
- * 2) BOT_TOKEN=... CHAT_ID=... node bot.js
+ * Запуск:
+ *  npm i node-fetch
+ *  BOT_TOKEN=... CHAT_ID=... node bot.js
  *
  * Важно:
  * - Все тексты в Telegram на русском, тикер латиницей.
@@ -13,6 +13,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const fetch = require("node-fetch");
 
 // ========================
@@ -24,26 +25,26 @@ const CFG = {
 
   // Telegram
   BOT_TOKEN: process.env.BOT_TOKEN || "",
-  CHAT_ID: process.env.CHAT_ID || "409865672", // можешь переопределить env'ом
+  CHAT_ID: process.env.CHAT_ID || "409865672", // можно переопределить env'ом
 
   // Сканирование
-  TOP_N_SYMBOLS: 120, // было 60
-  MIN_QUOTE_VOLUME_USDT: 1_000_000, // было 3_000_000
-  SYMBOLS_PER_TICK: 40, // было 20
-  TICK_INTERVAL_MS: 25_000, // пауза между тиками (внутри тика ещё есть лимитер)
+  TOP_N_SYMBOLS: 120,
+  MIN_QUOTE_VOLUME_USDT: 1_000_000,
+  SYMBOLS_PER_TICK: 40,
+  TICK_INTERVAL_MS: 25_000,
 
   // D1 блоки
   D1_LOOKBACK: 220,
   D1_PIVOT_LEFT: 2,
   D1_PIVOT_RIGHT: 2,
-  D1_BLOCK_TOL_PCT: 0.006, // было 0.0035 (шире)
+  D1_BLOCK_TOL_PCT: 0.006,
   MAX_BLOCKS_PER_SYMBOL: 2, // 1 primary + 1 mitigation
 
   // H1 структура
   H1_LOOKBACK: 200,
-  H1_PIVOT_LEFT: 1, // было 2 (быстрее, шумнее)
-  H1_PIVOT_RIGHT: 1, // было 2
-  RETEST_TOL_PCT: 0.005, // было 0.003 (шире)
+  H1_PIVOT_LEFT: 1,
+  H1_PIVOT_RIGHT: 1,
+  RETEST_TOL_PCT: 0.005,
 
   // BOS
   BOS_MODE: "close_or_wick", // "close_only" или "close_or_wick"
@@ -55,14 +56,13 @@ const CFG = {
 
   // Диагностика
   DEBUG_PHASE_NOTIFICATIONS: false,
-  HEARTBEAT_TZ: "Europe/Moscow",
-  HEARTBEAT_FROM_HOUR: 10,
-  HEARTBEAT_TO_HOUR: 22,
-  HEARTBEAT_ONLY_ON_MINUTE: 0,
+
+  // Heartbeat: 24/7 раз в час, не зависит от перезапуска
+  HEARTBEAT_EVERY_MS: 60 * 60 * 1000,
 
   // Лимиты запросов
   HTTP_TIMEOUT_MS: 12_000,
-  HTTP_MIN_GAP_MS: 220, // минимальный интервал между запросами (простой лимитер)
+  HTTP_MIN_GAP_MS: 220,
 };
 
 // =========
@@ -82,7 +82,6 @@ function clamp(n, a, b) {
 }
 function fmt(n) {
   if (n == null || Number.isNaN(n)) return "—";
-  // для крипты оставим разумную точность
   const abs = Math.abs(n);
   if (abs >= 1000) return n.toFixed(2);
   if (abs >= 10) return n.toFixed(3);
@@ -106,10 +105,18 @@ function loadState() {
       symbols_state: s.symbols_state || {},
       sent: s.sent || {},
       metrics: s.metrics || {},
-      last_heartbeat_key: s.last_heartbeat_key || "",
+      last_heartbeat_at_ms: s.last_heartbeat_at_ms || 0,
+      last_cfg_hash: s.last_cfg_hash || "",
     };
   } catch {
-    return { rr_index: 0, symbols_state: {}, sent: {}, metrics: {}, last_heartbeat_key: "" };
+    return {
+      rr_index: 0,
+      symbols_state: {},
+      sent: {},
+      metrics: {},
+      last_heartbeat_at_ms: 0,
+      last_cfg_hash: "",
+    };
   }
 }
 function saveState(state) {
@@ -145,17 +152,14 @@ async function httpGetJson(url) {
 async function fetchExchangeInfo() {
   return httpGetJson(`${CFG.BINANCE_FAPI}/fapi/v1/exchangeInfo`);
 }
-
 async function fetch24hTickers() {
   return httpGetJson(`${CFG.BINANCE_FAPI}/fapi/v1/ticker/24hr`);
 }
-
 async function fetchKlines(symbol, interval, limit) {
   const url =
     `${CFG.BINANCE_FAPI}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}` +
     `&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(String(limit))}`;
   const data = await httpGetJson(url);
-  // Binance kline: [ openTime, open, high, low, close, volume, closeTime, quoteVol, ... ]
   return data.map((k) => ({
     openTime: k[0],
     open: Number(k[1]),
@@ -179,10 +183,7 @@ async function getTopSymbolsUSDTPerp() {
 
   const filtered = (tickers || [])
     .filter((t) => perpSet.has(t.symbol))
-    .map((t) => ({
-      symbol: t.symbol,
-      quoteVolume: Number(t.quoteVolume),
-    }))
+    .map((t) => ({ symbol: t.symbol, quoteVolume: Number(t.quoteVolume) }))
     .filter((x) => Number.isFinite(x.quoteVolume) && x.quoteVolume >= CFG.MIN_QUOTE_VOLUME_USDT)
     .sort((a, b) => b.quoteVolume - a.quoteVolume)
     .slice(0, CFG.TOP_N_SYMBOLS);
@@ -194,7 +195,6 @@ async function getTopSymbolsUSDTPerp() {
 // Pivot helpers (фракталы)
 // =========================
 function computePivots(candles, left, right) {
-  // Возвращает массив pivot'ов вида: { i, type: "high"|"low", price, time }
   const pivots = [];
   for (let i = left; i < candles.length - right; i++) {
     const c = candles[i];
@@ -222,32 +222,23 @@ function lastPivotBefore(pivots, idx, type) {
 }
 
 // =========================
-// D1 blocks (приближённо)
+// D1 blocks (эвристика)
 // =========================
 function detectD1Blocks(d1Candles) {
-  // Это не “идеальная SMC”, а рабочая эвристика под твой саммари:
-  // - Ищем импульс, который обновил предыдущий swing
-  // - Блоком считаем свечу перед импульсом противоположного направления
-  // - mitigation блок: ретест перебитого swing уровня (условно)
   const pivots = computePivots(d1Candles, CFG.D1_PIVOT_LEFT, CFG.D1_PIVOT_RIGHT);
-
   const blocks = [];
 
-  // Ищем последние импульсы, которые пробили swing
   for (let i = CFG.D1_PIVOT_LEFT + 2; i < d1Candles.length; i++) {
     const c = d1Candles[i];
 
-    // Для лонга: пробили предыдущий pivot high
     const prevHigh = lastPivotBefore(pivots, i, "high");
     if (prevHigh && c.high > prevHigh.price) {
-      // block candle = предыдущая свеча, желательно bearish
       const b = d1Candles[i - 1];
       if (isBear(b)) {
         blocks.push({
           id: `D1P_LONG_${b.openTime}`,
           side: "long",
           type: "Движущий",
-          // диапазон блока берём как high/low свечи блока (тело+тень)
           low: b.low,
           high: b.high,
           blockTime: b.openTime,
@@ -256,7 +247,6 @@ function detectD1Blocks(d1Candles) {
       }
     }
 
-    // Для шорта: пробили предыдущий pivot low
     const prevLow = lastPivotBefore(pivots, i, "low");
     if (prevLow && c.low < prevLow.price) {
       const b = d1Candles[i - 1];
@@ -274,25 +264,20 @@ function detectD1Blocks(d1Candles) {
     }
   }
 
-  // Оставим только самые свежие по времени
   blocks.sort((a, b) => b.blockTime - a.blockTime);
-
   const primary = blocks[0] ? [blocks[0]] : [];
 
-  // mitigation: если после первичного пробоя цена возвращалась к brokenSwing (примерно)
   const mitigation = [];
   if (primary[0]) {
     const p = primary[0];
     const swing = p.brokenSwing;
-    // найдём свечу ретеста swing в будущем после блока
     const afterIdx = d1Candles.findIndex((x) => x.openTime === p.blockTime);
     if (afterIdx >= 0) {
       for (let i = afterIdx + 1; i < d1Candles.length; i++) {
         const c = d1Candles[i];
-        const tol = pctTol(swing, 0.0015); // маленький допуск на swing ретест
+        const tol = pctTol(swing, 0.0015);
         const touched = c.low <= swing + tol && c.high >= swing - tol;
         if (touched) {
-          // mitigation block как свеча “в точке ретеста”
           mitigation.push({
             id: `D1M_${p.side.toUpperCase()}_${c.openTime}`,
             side: p.side,
@@ -308,8 +293,7 @@ function detectD1Blocks(d1Candles) {
     }
   }
 
-  const out = [...primary, ...mitigation].slice(0, CFG.MAX_BLOCKS_PER_SYMBOL);
-  return out;
+  return [...primary, ...mitigation].slice(0, CFG.MAX_BLOCKS_PER_SYMBOL);
 }
 
 // =========================
@@ -334,18 +318,16 @@ function checkTouchH1(block, h1Candle) {
 // H1 структура: P1 динамика, P2/P3 pivots, BOS, ретест
 // =========================
 function updateStructure(symbolState, h1Candles) {
-  // Мы смотрим только с момента касания (touch_time) до текущего бара
   const touchTime = symbolState.touch_time;
   const fromIdx = h1Candles.findIndex((c) => c.openTime >= touchTime);
   const slice = fromIdx >= 0 ? h1Candles.slice(fromIdx) : h1Candles;
 
-  if (slice.length < 10) return; // мало данных
+  if (slice.length < 10) return;
 
-  const side = symbolState.side; // "long"|"short"
+  const side = symbolState.side;
 
   // 1) Динамическая P1
   if (side === "short") {
-    // P1 = max high
     let maxH = -Infinity;
     let maxT = null;
     for (const c of slice) {
@@ -357,14 +339,12 @@ function updateStructure(symbolState, h1Candles) {
     const prevP1 = symbolState.p1?.price ?? null;
     if (prevP1 == null || maxH > prevP1 + 1e-12) {
       symbolState.p1 = { price: maxH, time: maxT };
-      // сбросим P2/P3/BOS, потому что “верхняя точка” обновилась
       symbolState.p2 = null;
       symbolState.p3 = null;
       symbolState.bos = null;
       symbolState.phase = "WAIT_BOS";
     }
   } else {
-    // long: P1 = min low
     let minL = Infinity;
     let minT = null;
     for (const c of slice) {
@@ -386,13 +366,9 @@ function updateStructure(symbolState, h1Candles) {
   // 2) Pivot'ы на H1 для P2/P3
   const pivots = computePivots(slice, CFG.H1_PIVOT_LEFT, CFG.H1_PIVOT_RIGHT);
 
-  // Для удобства берём последние pivot'ы после P1 time
   const p1Time = symbolState.p1?.time;
   const pivAfterP1 = p1Time ? pivots.filter((p) => slice[p.i].openTime >= p1Time) : pivots;
 
-  // Логика:
-  // short: P1 high, P2 = ближайший pivot low после P1, P3 = следующий pivot high после P2
-  // long:  P1 low,  P2 = ближайший pivot high после P1, P3 = следующий pivot low после P2
   if (!symbolState.p2) {
     if (side === "short") {
       const p2 = pivAfterP1.find((p) => p.type === "low");
@@ -442,7 +418,7 @@ function updateStructure(symbolState, h1Candles) {
     }
   }
 
-  // 4) Ретест P2 или P3
+  // 4) Ретест
   if (symbolState.phase === "WAIT_RETEST" && symbolState.bos) {
     const last = slice[slice.length - 1];
     const levels = [];
@@ -480,8 +456,7 @@ async function sendTelegram(text) {
 }
 
 function directionHeader(symbol, side) {
-  if (side === "long") return `${symbol}  |  🟢 ЛОНГ`;
-  return `${symbol}  |  🔴 ШОРТ`;
+  return side === "long" ? `${symbol}  |  🟢 ЛОНГ` : `${symbol}  |  🔴 ШОРТ`;
 }
 
 function formatSignalMessage(symbol, st) {
@@ -504,11 +479,7 @@ function formatSignalMessage(symbol, st) {
   } else {
     lines.push("Слом структуры (BOS): —");
   }
-  if (st.retest) {
-    lines.push(`Ретест: ${st.retest.levelName}`);
-  } else {
-    lines.push("Ретест: —");
-  }
+  lines.push(st.retest ? `Ретест: ${st.retest.levelName}` : "Ретест: —");
   return lines.join("\n");
 }
 
@@ -536,42 +507,54 @@ function shouldSendByTtl(sentMap, symbol, touchId) {
   const ageH = (nowMs() - ts) / (1000 * 60 * 60);
   return ageH >= CFG.SIGNAL_TTL_HOURS;
 }
-
 function markSent(sentMap, symbol, touchId) {
   if (!sentMap[symbol]) sentMap[symbol] = {};
   sentMap[symbol][touchId] = nowMs();
 }
 
 // =========================
-// Heartbeat
+// Heartbeat + "настройки обновлены"
 // =========================
-function mskNow() {
-  // без внешних либ: приблизительно берём локаль MSK через Intl
-  const d = new Date();
-  const parts = new Intl.DateTimeFormat("ru-RU", {
-    timeZone: CFG.HEARTBEAT_TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(d);
+function cfgPublicSnapshot() {
+  // Только то, что реально важно видеть в чате
+  return {
+    TOP_N_SYMBOLS: CFG.TOP_N_SYMBOLS,
+    MIN_QUOTE_VOLUME_USDT: CFG.MIN_QUOTE_VOLUME_USDT,
+    SYMBOLS_PER_TICK: CFG.SYMBOLS_PER_TICK,
+    D1_BLOCK_TOL_PCT: CFG.D1_BLOCK_TOL_PCT,
+    H1_PIVOT_LEFT: CFG.H1_PIVOT_LEFT,
+    H1_PIVOT_RIGHT: CFG.H1_PIVOT_RIGHT,
+    BOS_MODE: CFG.BOS_MODE,
+    BOS_WICK_TOL_PCT: CFG.BOS_WICK_TOL_PCT,
+    RETEST_TOL_PCT: CFG.RETEST_TOL_PCT,
+    SIGNAL_TTL_HOURS: CFG.SIGNAL_TTL_HOURS,
+    HEARTBEAT_EVERY_MIN: Math.round(CFG.HEARTBEAT_EVERY_MS / 60000),
+  };
+}
 
-  const get = (t) => parts.find((p) => p.type === t)?.value;
-  const yyyy = get("year");
-  const mm = get("month");
-  const dd = get("day");
-  const hh = Number(get("hour"));
-  const mi = Number(get("minute"));
-  return { yyyy, mm, dd, hh, mi, key: `${yyyy}-${mm}-${dd} ${String(hh).padStart(2, "0")}:${String(mi).padStart(2, "0")}` };
+function cfgHash(snapshot) {
+  const json = JSON.stringify(snapshot);
+  return crypto.createHash("sha256").update(json).digest("hex");
+}
+
+async function notifyIfCfgChanged(state) {
+  const snap = cfgPublicSnapshot();
+  const h = cfgHash(snap);
+  if (h === state.last_cfg_hash) return;
+
+  const lines = [];
+  lines.push("⚙️ Настройки обновлены");
+  for (const [k, v] of Object.entries(snap)) lines.push(`${k}: ${v}`);
+
+  await sendTelegram(lines.join("\n"));
+  state.last_cfg_hash = h;
 }
 
 function summarizePhases(state, symbols) {
   let a = 0,
     b = 0,
     c = 0,
-    d = 0,
+    other = 0,
     r = 0;
   for (const s of symbols) {
     const st = state.symbols_state[s];
@@ -580,36 +563,30 @@ function summarizePhases(state, symbols) {
     else if (ph === "WAIT_BOS") b++;
     else if (ph === "WAIT_RETEST") c++;
     else if (ph === "SIGNAL_READY") r++;
-    else d++;
+    else other++;
   }
-  return { a, b, c, d, r };
+  return { a, b, c, other, r };
 }
 
 async function maybeHeartbeat(state, symbols) {
-  const t = mskNow();
-  if (t.mi !== CFG.HEARTBEAT_ONLY_ON_MINUTE) return;
+  const last = state.last_heartbeat_at_ms || 0;
+  const due = nowMs() - last >= CFG.HEARTBEAT_EVERY_MS;
 
-  if (t.hh < CFG.HEARTBEAT_FROM_HOUR || t.hh > CFG.HEARTBEAT_TO_HOUR) return;
+  if (!due) return;
 
-  // чтобы не слать повторно в тот же час-минуту
-  if (state.last_heartbeat_key === t.key) return;
-
-  const { a, b, c, d, r } = summarizePhases(state, symbols);
+  const { a, b, c, other, r } = summarizePhases(state, symbols);
   const m = state.metrics || {};
+  const dt = new Date().toISOString().replace("T", " ").slice(0, 19);
+
   const lines = [];
-  lines.push(`💓 Хартбит (${t.key} МСК)`);
+  lines.push(`💓 Хартбит (${dt} UTC)`);
   lines.push(`Инструментов: ${symbols.length}`);
-  lines.push(`Фазы: касание ${a} | слом ${b} | ретест ${c} | сигнал готов ${r} | прочее ${d}`);
+  lines.push(`Фазы: касание ${a} | слом ${b} | ретест ${c} | сигнал готов ${r} | прочее ${other}`);
   lines.push(`За сутки: касаний ${m.touches || 0} | BOS ${m.bos || 0} | ретестов ${m.retests || 0} | сигналов ${m.signals || 0}`);
   if (m.last_error) lines.push(`Ошибка: ${m.last_error}`);
 
-  try {
-    await sendTelegram(lines.join("\n"));
-    state.last_heartbeat_key = t.key;
-  } catch (e) {
-    // не рушим цикл
-    state.metrics.last_error = `Хартбит: ${String(e.message || e).slice(0, 180)}`;
-  }
+  await sendTelegram(lines.join("\n"));
+  state.last_heartbeat_at_ms = nowMs();
 }
 
 // =========================
@@ -618,28 +595,25 @@ async function maybeHeartbeat(state, symbols) {
 async function processSymbol(state, symbol) {
   const symState = state.symbols_state[symbol] || { phase: "WAIT_D1_TOUCH" };
 
-  // Подкачаем данные
   const [d1, h1] = await Promise.all([fetchKlines(symbol, "1d", CFG.D1_LOOKBACK), fetchKlines(symbol, "1h", CFG.H1_LOOKBACK)]);
   if (!d1.length || !h1.length) return;
 
-  // 1) Получить D1 блоки
   const blocks = detectD1Blocks(d1);
   if (!blocks.length) {
-    // если блоков нет, просто ждём
     symState.phase = "WAIT_D1_TOUCH";
     state.symbols_state[symbol] = symState;
     return;
   }
 
-  // 2) Фаза A: ждём касание
+  // A) ждём касание
   if (symState.phase === "WAIT_D1_TOUCH") {
     const lastH1 = h1[h1.length - 1];
 
-    // Проверим касание любым блоком, приоритет: primary (первый в списке)
     for (const b of blocks) {
       const touchKind = checkTouchH1(b, lastH1);
       if (touchKind) {
         const touchId = `${b.id}:${lastH1.openTime}`;
+
         symState.phase = "WAIT_BOS";
         symState.side = b.side;
         symState.touch_id = touchId;
@@ -667,11 +641,13 @@ async function processSymbol(state, symbol) {
     }
   }
 
-  // 3) Фаза B/C: структура + BOS + ретест
+  // B/C) структура + BOS + ретест
   if (symState.phase === "WAIT_BOS" || symState.phase === "WAIT_RETEST") {
+    const prevBosTime = symState.bos?.time || null;
+
     updateStructure(symState, h1);
 
-    if (symState.bos && symState.phase === "WAIT_RETEST") {
+    if (symState.bos && symState.bos.time !== prevBosTime) {
       state.metrics.bos = (state.metrics.bos || 0) + 1;
       if (CFG.DEBUG_PHASE_NOTIFICATIONS) {
         await sendTelegram(formatPhaseMessage(symbol, symState));
@@ -683,7 +659,7 @@ async function processSymbol(state, symbol) {
     }
   }
 
-  // 4) Фаза SIGNAL_READY: проверить антиспам и отправить
+  // SIGNAL_READY) антиспам + отправка
   if (symState.phase === "SIGNAL_READY") {
     const touchId = symState.touch_id;
     if (touchId && shouldSendByTtl(state.sent, symbol, touchId)) {
@@ -692,7 +668,6 @@ async function processSymbol(state, symbol) {
       markSent(state.sent, symbol, touchId);
       state.metrics.signals = (state.metrics.signals || 0) + 1;
     }
-    // После сигнала остаёмся в “ожидании нового касания”, но антиспам через sent+ttl
     symState.phase = "WAIT_D1_TOUCH";
   }
 
@@ -717,18 +692,40 @@ async function main() {
     process.exit(1);
   }
 
-  while (true) {
+  // 1) Уведомление, что настройки изменились (после деплоя/изменения CFG)
+  try {
+    await notifyIfCfgChanged(state);
+    saveState(state);
+  } catch (e) {
+    state.metrics.last_error = `Настройки: ${String(e.message || e).slice(0, 180)}`;
+    saveState(state);
+  }
+
+  // 2) Если хартбита ещё не было вообще, можно сразу дать первый пинг
+  if (!state.last_heartbeat_at_ms) {
     try {
       await maybeHeartbeat(state, symbols);
+      saveState(state);
+    } catch (e) {
+      state.metrics.last_error = `Хартбит старт: ${String(e.message || e).slice(0, 180)}`;
+      saveState(state);
+    }
+  }
 
-      // Round-robin: берём порцию символов
+  while (true) {
+    try {
+      // Хартбит по таймеру (24/7, независимо от минуты, с памятью в state.json)
+      try {
+        await maybeHeartbeat(state, symbols);
+      } catch (e) {
+        state.metrics.last_error = `Хартбит: ${String(e.message || e).slice(0, 180)}`;
+      }
+
       const n = symbols.length;
       const batchSize = clamp(CFG.SYMBOLS_PER_TICK, 1, n || 1);
       const start = state.rr_index % (n || 1);
       const batch = [];
-      for (let k = 0; k < batchSize; k++) {
-        batch.push(symbols[(start + k) % n]);
-      }
+      for (let k = 0; k < batchSize; k++) batch.push(symbols[(start + k) % n]);
       state.rr_index = (start + batchSize) % (n || 1);
 
       for (const s of batch) {
@@ -736,13 +733,11 @@ async function main() {
           await processSymbol(state, s);
         } catch (e) {
           state.metrics.last_error = `${s}: ${String(e.message || e).slice(0, 180)}`;
-          // продолжаем
         }
       }
 
       saveState(state);
     } catch (e) {
-      // общий catch цикла
       state.metrics.last_error = `Цикл: ${String(e.message || e).slice(0, 180)}`;
       saveState(state);
     }
