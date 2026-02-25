@@ -31,7 +31,7 @@ CONFIG = {
 
     # Scheduler / load
     "RUN_EVERY_SECONDS": int(os.environ.get("RUN_EVERY_SECONDS", "60")),  # main loop tick
-    "SYMBOLS_PER_TICK": int(os.environ.get("SYMBOLS_PER_TICK", "12")),    # round-robin batch size
+    "SYMBOLS_PER_TICK": int(os.environ.get("SYMBOLS_PER_TICK", "30")),    # round-robin batch size
 
     # Caches
     "UNIVERSE_CACHE_SEC": int(os.environ.get("UNIVERSE_CACHE_SEC", "600")),  # 10 min
@@ -44,18 +44,18 @@ CONFIG = {
 
     # H1 structure
     "H1_LOOKBACK_BARS": int(os.environ.get("H1_LOOKBACK_BARS", "260")),
-    "H1_PIVOT_LEFT": int(os.environ.get("H1_PIVOT_LEFT", "3")),
-    "H1_PIVOT_RIGHT": int(os.environ.get("H1_PIVOT_RIGHT", "3")),
+    "H1_PIVOT_LEFT": int(os.environ.get("H1_PIVOT_LEFT", "2")),
+    "H1_PIVOT_RIGHT": int(os.environ.get("H1_PIVOT_RIGHT", "2")),
 
     # Touch tolerance
-    "D1_BLOCK_TOL_PCT": float(os.environ.get("D1_BLOCK_TOL_PCT", "0.0025")),  # 0.25% default
+    "D1_BLOCK_TOL_PCT": float(os.environ.get("D1_BLOCK_TOL_PCT", "0.0035")),  # 0.25% default
 
     # BOS rule (твоя правка: слом только по CLOSE за уровнем)
     # БЕЗ "каменного" буфера по умолчанию (0). Можно чуть-чуть поставить, если захочешь.
     "BOS_MIN_PCT": float(os.environ.get("BOS_MIN_PCT", "0.0")),  # 0.0 = ровно за уровень
 
     # Retest tolerance
-    "RETEST_TOL_PCT": float(os.environ.get("RETEST_TOL_PCT", "0.0020")),
+    "RETEST_TOL_PCT": float(os.environ.get("RETEST_TOL_PCT", "0.0030")),
 
     # Heartbeat window (MSK)
     "HEARTBEAT_START_HOUR_MSK": int(os.environ.get("HEARTBEAT_START_HOUR_MSK", "10")),
