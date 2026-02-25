@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 
 # ================= CONFIG =================
 
-TG_TOKEN = "PASTE_YOUR_TELEGRAM_TOKEN"
-TG_CHAT_ID = "PASTE_YOUR_CHAT_ID"
+TG_TOKEN = "8310746614:AAEAcw9Uvdst2uXFIrakwczzB0096Xnttxk"
+TG_CHAT_ID = "409865672"
 
 BASE_URL = "https://fapi.binance.com"
 
