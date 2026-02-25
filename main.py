@@ -10,7 +10,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-LAST_HEARTBEAT_HOUR_KEY = None
 
 
 # =========================
